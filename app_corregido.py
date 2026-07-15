@@ -550,6 +550,33 @@ def feller_condition(params):
     return lhs >= rhs, lhs, rhs
 
 
+def simulate_recalibration_perturbation(rows, S0, r, q, kappa_fijo=None,
+                                          iv_bump=0.005, spot_bump_pct=0.01, seed=7):
+    """Emula 'recalibrate on two different days and compare' (feedback del quant
+    developer) SIN esperar a que pase un día real: perturba cada IV observada con
+    ruido ~0.5 vol pt (iv_bump=0.005), mueve el spot ~1%, reconvierte a precios con
+    B&S, y vuelve a calibrar Heston sobre esos precios "de otro día simulado". Si el
+    problema de calibración está bien planteado, los parámetros deberían moverse poco
+    frente a un empujón tan chico en los inputs; si hay un valle de identificabilidad
+    (kappa-xi, ver notebook 5), un empujón mínimo hace que salten mucho -- eso es
+    justamente la inestabilidad que el brief pide detectar, demostrable en el momento
+    en vez de depender de correr el dashboard en dos fechas distintas."""
+    rng = np.random.default_rng(seed)
+    S0_pert = S0 * (1 + spot_bump_pct)
+    rows_pert = []
+    for K, tau_, mkt, spread, opt in rows:
+        iv = bs_implied_vol(mkt, S0, K, r, q, tau_, opt)
+        if not np.isfinite(iv) or iv <= 0:
+            rows_pert.append((K, tau_, mkt, spread, opt))
+            continue
+        iv_new = max(iv + rng.normal(0, iv_bump), 0.01)
+        mkt_new = bs_price(S0_pert, K, r, q, tau_, iv_new, opt)
+        rows_pert.append((K, tau_, mkt_new, spread, opt))
+    params_pert, fit_pert = calibrate_heston(rows_pert, S0_pert, r, q, kappa_fijo=kappa_fijo)
+    return params_pert, fit_pert
+
+
+
 # ============================================================
 # 1D. VALIDACIONES EXTRA DEL MOTOR DE HESTON
 # (adoptadas de quant_options_dashboard5.zip, adaptadas a este archivo)
@@ -675,7 +702,7 @@ def get_risk_free_rate():
         df = web.DataReader("DTB3", "fred", start, end)
         return float(df.dropna().iloc[-1, 0]) / 100.0
     except Exception:
-        return 0.045  # fallback razonable
+        return 0.0378  # fallback: T-Bill de referencia al 2026-07-15 (actualizado manualmente)
 
 
 @st.cache_data(ttl=60, show_spinner=False)  # 60s, no 30min: en 0-3DTE el spot/bid/ask se mueven demasiado rápido
@@ -1661,7 +1688,7 @@ st.caption(
 )
 
 
-SMILE_COLUMNS = ["strike", "moneyness", "iv", "type"]
+SMILE_COLUMNS = ["strike", "moneyness", "log_moneyness", "iv", "type"]
 
 
 def build_smile_data(chain_df, S0, r, q, tau):
@@ -1682,7 +1709,8 @@ def build_smile_data(chain_df, S0, r, q, tau):
             continue
         iv = bs_implied_vol(row["mid"], S0, row["strike"], r, q, tau, otype)
         if not np.isnan(iv) and 0.01 < iv < 10.0:
-            rows.append({"strike": row["strike"], "moneyness": row["strike"] / S0, "iv": iv, "type": otype})
+            rows.append({"strike": row["strike"], "moneyness": row["strike"] / S0,
+                         "log_moneyness": np.log(row["strike"] / S0), "iv": iv, "type": otype})
     if not rows:
         return pd.DataFrame(columns=SMILE_COLUMNS)
     return pd.DataFrame(rows).sort_values("moneyness").reset_index(drop=True)
@@ -1742,24 +1770,24 @@ else:
 
     fig3 = go.Figure()
     fig3.add_trace(go.Scatter(
-        x=smile_df["moneyness"], y=smile_df["iv"] * 100, mode="markers", name="Mercado (OTM)",
+        x=smile_df["log_moneyness"], y=smile_df["iv"] * 100, mode="markers", name="Mercado (OTM)",
         marker=dict(color="#EAF2FB", size=8, symbol="circle"),
-        text=smile_df["type"], hovertemplate="moneyness=%{x:.2f}<br>IV=%{y:.2f}%<br>%{text}<extra></extra>",
+        text=smile_df["type"], hovertemplate="log-moneyness=%{x:.3f}<br>IV=%{y:.2f}%<br>%{text}<extra></extra>",
     ))
     fig3.add_trace(go.Scatter(
-        x=smile_df["moneyness"], y=[sigma_flat * 100] * len(smile_df), mode="lines", name=f"B&S (σ plana = {sigma_flat*100:.1f}%)",
+        x=smile_df["log_moneyness"], y=[sigma_flat * 100] * len(smile_df), mode="lines", name=f"B&S (σ plana = {sigma_flat*100:.1f}%)",
         line=dict(color="#3B82C4", width=2.5, dash="dot"),
     ))
     fig3.add_trace(go.Scatter(
-        x=smile_df["moneyness"], y=smile_df["heston_iv"] * 100, mode="lines+markers", name="Heston (calibrado)",
+        x=smile_df["log_moneyness"], y=smile_df["heston_iv"] * 100, mode="lines+markers", name="Heston (calibrado)",
         line=dict(color="#1FAE85", width=2.5), marker=dict(size=5),
     ))
-    fig3.add_vline(x=1.0, line_dash="dash", line_color="#8492A6", annotation_text="ATM", annotation_font_color="#8492A6")
-    fig3.add_vline(x=strike / S0, line_color="#D9822B", annotation_text="Seleccionado", annotation_font_color="#D9822B")
+    fig3.add_vline(x=0.0, line_dash="dash", line_color="#8492A6", annotation_text="ATM", annotation_font_color="#8492A6")
+    fig3.add_vline(x=np.log(strike / S0), line_color="#D9822B", annotation_text="Seleccionado", annotation_font_color="#D9822B")
     fig3.update_layout(
         template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         height=420, margin=dict(l=10, r=10, t=30, b=10),
-        xaxis_title="Moneyness (K/S₀)", yaxis_title="Volatilidad implícita (%)",
+        xaxis_title="log-moneyness ln(K/S₀)", yaxis_title="Volatilidad implícita (%)",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig3, use_container_width=True)
@@ -2174,3 +2202,38 @@ with st.expander("📐 Validación de la calibración en puntos de volatilidad")
         st.success("✅ ρ < 0: leverage effect esperado en equities (consistente con la teoría).")
     else:
         st.warning("⚠️ ρ ≥ 0: inusual para equities — vale la pena revisar antes de defenderlo en vivo.")
+
+with st.expander("🔁 Recalibración simulada: ¿qué pasaría 'otro día'? (sin esperar)"):
+    st.caption(
+        "Complemento a tu historial de `calibration_history.csv`: en vez de esperar a correr el "
+        "dashboard mañana, esto perturba cada IV observada con ruido de ~0.5 puntos de vol y mueve "
+        "el spot ~1%, reconvierte a precios, y vuelve a calibrar sobre ese 'día simulado'. Si el "
+        "problema está bien planteado, los parámetros deberían moverse poco frente a un empujón tan "
+        "chico — si no, es evidencia de un valle de identificabilidad (κ–ξ), demostrable ahora mismo "
+        "frente al profesor, no solo cuando junte varios días reales de historial."
+    )
+    if st.button("Simular recalibración con datos de 'otro día'"):
+        with st.spinner("Perturbando IVs/spot y recalibrando..."):
+            params_pert, fit_pert = simulate_recalibration_perturbation(
+                rows_calib, S0, r, q, kappa_fijo=kappa_fijo_val
+            )
+        sim_cols = st.columns(5)
+        param_keys_sim = ["v0", "theta", "kappa", "xi", "rho"]
+        max_pct_sim = 0.0
+        for col, key, lab, old_v, new_v in zip(
+            sim_cols, param_keys_sim, labels, heston_params, params_pert
+        ):
+            pct = abs(new_v - old_v) / (abs(old_v) + 1e-6) * 100
+            max_pct_sim = max(max_pct_sim, pct)
+            col.metric(lab, f"{new_v:.4f}", f"{new_v - old_v:+.4f} ({pct:.0f}%)")
+        if max_pct_sim > 50:
+            st.warning(
+                f"⚠️ Con un empujón de apenas ~0.5 vol pt / 1% en spot, al menos un parámetro cambió "
+                f"{max_pct_sim:.0f}% — la calibración de este vencimiento es sensible/inestable a ruido "
+                "chico en los inputs. Es exactamente el riesgo que advierte el feedback del quant developer."
+            )
+        else:
+            st.success(
+                f"✅ Los parámetros se mueven poco (cambio máximo {max_pct_sim:.0f}%) ante un empujón "
+                "chico en los datos — la calibración de este vencimiento parece razonablemente robusta."
+            )
