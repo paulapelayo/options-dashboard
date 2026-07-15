@@ -558,20 +558,33 @@ def _robust_dividend_yield(tk, S0):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_clean_chain(ticker, expiry):
-    """Descarga y limpia la cadena de opciones (calls y puts) para un expiry dado."""
+    """Descarga y limpia la cadena de opciones (calls y puts) para un expiry dado.
+    Devuelve (df_limpio, diagnostico) -- diagnostico trae conteos crudos por lado
+    (calls/puts) y cuantos sobrevivieron cada filtro, para poder explicar un chain
+    vacio en vez de solo reportar "no hay quotes liquidas". Tambien corrige un bug:
+    la version anterior comparaba bid/ask NaN directo contra 0 (NaN<=0 es False en
+    Python), asi que filas sin cotizacion real podian colarse; ahora se usa
+    pd.isna() explicito."""
     tk = yf.Ticker(ticker)
     chain = tk.option_chain(expiry)
     rows = []
+    diag = {}
     for df, otype in [(chain.calls, "call"), (chain.puts, "put")]:
+        n0 = len(df)
+        n_bidask = 0
+        n_liquido = 0
         for _, row in df.iterrows():
             bid, ask = row.get("bid", 0), row.get("ask", 0)
-            vol = row.get("volume", 0) or 0
-            if bid is None or ask is None:
+            if pd.isna(bid) or pd.isna(ask) or bid <= 0 or ask <= 0:
                 continue
-            if bid <= 0 or ask <= 0:
-                continue
-            if (vol or 0) <= 0 and (row.get("openInterest", 0) or 0) <= 0:
+            n_bidask += 1
+            vol = row.get("volume", 0)
+            vol = 0 if pd.isna(vol) else vol
+            oi = row.get("openInterest", 0)
+            oi = 0 if pd.isna(oi) else oi
+            if vol <= 0 and oi <= 0:
                 continue  # descarta ilíquidos sin volumen NI open interest
+            n_liquido += 1
             mid = (bid + ask) / 2.0
             spread = ask - bid
             rows.append(
@@ -583,12 +596,13 @@ def get_clean_chain(ticker, expiry):
                     "mid": mid,
                     "spread": spread,
                     "volume": vol,
-                    "openInterest": row.get("openInterest", 0),
+                    "openInterest": oi,
                     "impliedVolatility": row.get("impliedVolatility", np.nan),
                 }
             )
+        diag[otype] = {"crudos_yfinance": n0, "con_bid_ask_valido": n_bidask, "liquidos": n_liquido}
     df = pd.DataFrame(rows)
-    return df
+    return df, diag
 
 
 def tau_from_expiry(expiry_str):
@@ -683,17 +697,30 @@ expiry = st.sidebar.selectbox("Vencimiento (expiry)", expiries, key="expiry_sele
 option_type = st.sidebar.radio("Tipo de contrato", ["call", "put"], horizontal=True, key="type_radio")
 
 with st.spinner("Descargando y limpiando cadena de opciones..."):
-    chain_df = get_clean_chain(ticker, expiry)
+    chain_df, chain_diag = get_clean_chain(ticker, expiry)
 
 if chain_df.empty:
-    st.sidebar.warning("No quedaron quotes líquidas tras la limpieza para este vencimiento.")
+    st.sidebar.warning(
+        f"No quedaron quotes líquidas tras la limpieza para este vencimiento. "
+        f"Diagnóstico: {chain_diag}"
+    )
     st.stop()
 
 sub_chain = chain_df[chain_df["type"] == option_type].sort_values("strike")
 strikes_available = sub_chain["strike"].unique().tolist()
 
 if not strikes_available:
-    st.sidebar.warning(f"No hay {option_type}s líquidos para este vencimiento.")
+    d = chain_diag.get(option_type, {})
+    st.sidebar.warning(
+        f"No hay {option_type}s líquidos para este vencimiento. "
+        f"yfinance devolvió {d.get('crudos_yfinance', '?')} contratos {option_type} en crudo, "
+        f"{d.get('con_bid_ask_valido', '?')} con bid/ask cotizado, y "
+        f"{d.get('liquidos', '?')} con volumen u open interest > 0. "
+        f"Si el primer número ya es 0 o muy bajo, es la cadena real de yfinance para este "
+        f"vencimiento (prueba otro expiry); si cae después, es liquidez real de mercado en "
+        f"este lado del chain. También puede ser cache viejo del deploy — prueba 'Clear cache' "
+        f"en el menú ⋮ de Streamlit Cloud."
+    )
     st.stop()
 
 # Si viene de un símbolo OCC, pre-seleccionamos el strike líquido más cercano al pedido
@@ -755,7 +782,7 @@ st.markdown(
 # ============================================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def calibrate_for_expiry(ticker, expiry, S0, r, q, kappa_fijo=None):
-    df = get_clean_chain(ticker, expiry)
+    df, _ = get_clean_chain(ticker, expiry)
     tau_ = tau_from_expiry(expiry)
 
     # Selección de quotes según el estándar del curso/equipos:
@@ -1346,7 +1373,7 @@ def build_smile_data(chain_df, S0, r, q, tau):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def compute_smile(ticker, expiry, S0, r, q, tau, heston_params_tuple):
-    chain_full = get_clean_chain(ticker, expiry)
+    chain_full, _ = get_clean_chain(ticker, expiry)
     smile_df = build_smile_data(chain_full, S0, r, q, tau)
     if smile_df.empty:
         return smile_df
@@ -1738,4 +1765,15 @@ else:
             "común con pocas quotes líquidas o vencimientos muy cortos. No es un error del código."
         )
     else:
-        st.su
+        st.success(
+            f"✅ Parámetros razonablemente estables (cambio máximo: {max_pct_change:.0f}%) entre las dos "
+            "calibraciones más recientes."
+        )
+
+    with st.expander("Ver historial completo de calibraciones"):
+        st.dataframe(
+            hist_df[["date", "v0", "theta", "kappa", "xi", "rho", "feller_ok", "n_quotes"]].style.format(
+                {"v0": "{:.4f}", "theta": "{:.4f}", "kappa": "{:.4f}", "xi": "{:.4f}", "rho": "{:.4f}"}
+            ),
+            use_container_width=True,
+        )
