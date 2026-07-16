@@ -148,7 +148,19 @@ def bs_implied_vol(price, S, K, r, q, tau, option_type="call", tol=1e-7):
     )
     if price <= intrinsic + 1e-8 or tau <= 0:
         return np.nan
-    lo, hi = 1e-6, 5.0
+    # hi=10.0 (1000% vol): alineado con el techo dinámico de calibración de Heston
+    # (var_ceiling <= 9.0 => vol <= 300%) con margen, y con el filtro de build_smile_data
+    # (antes eran tres topes DESALINEADOS: 5.0 aquí, 9.0 de varianza en calibración, 10.0
+    # en el filtro del smile -- el de 10.0 nunca se activaba porque este solver jamás
+    # podía devolver más de 5.0).
+    lo, hi = 1e-6, 10.0
+    # Guarda de rango: bs_price es monótona creciente en sigma. Si el precio pedido
+    # está fuera de [bs_price(lo), bs_price(hi)], NO hay sigma que lo reproduzca dentro
+    # del cap -- antes el bisector simplemente convergía despacio hacia el borde (hi) y
+    # devolvía ese número como si fuera una IV real, en vez de señalar "inalcanzable".
+    price_at_hi = bs_price(S, K, r, q, tau, hi, option_type)
+    if price >= price_at_hi:
+        return np.nan
     mid = 0.2
     for _ in range(100):
         mid = (lo + hi) / 2
@@ -223,7 +235,26 @@ def heston_price(S, K, r, q, tau, v0, kappa, theta, xi, rho, option_type="call")
 # espacio de parámetros, ~1e-8 en la región típica de equity.
 
 def _cos_call_raw(S0, K_array, r, q, tau, v0, kappa, theta, xi, rho, N=512, L=20):
-    """COS puro. Devuelve (precios, c2); precios=None si c2<=0 (fórmula de cumulantes rota)."""
+    """COS puro (Fang & Oosterlee 2008), CORREGIDO. Devuelve (precios, c2); precios=None si c2<=0.
+
+    BUGFIX (verificado numéricamente): la ventana de truncamiento [a,b] del método COS es
+    para la variable y=ln(S_T/K) -- NO para ln(S_T/S0) -- así que debe desplazarse por
+    x0=log(S0/K) EN CADA STRIKE. La versión anterior centraba [a,b] únicamente en el drift
+    (r-q)τ + ... del log-retorno, igual para todos los strikes, válido solo cuando x0≈0
+    (cerca del dinero). Para strikes bien ITM/OTM combinados con τ muy chico (ventana
+    angosta), la integral del payoff se evaluaba fuera de donde vive la densidad real,
+    dando precios muy alejados del motor de Fourier/quad de referencia -- reproducido:
+    S0=220, K=500, τ=2 días, kappa=6, xi=1.5, rho=-0.95 -> COS viejo daba $13.66 cuando
+    el precio real es $0.00. Las guardas de heston_calls_fast (no-arbitraje, monotonía)
+    no siempre lo atrapan porque el chequeo de monotonía solo actúa con 2+ strikes, y un
+    precio de $13.66 seguía técnicamente dentro de [intrínseco, S0] para un solo contrato.
+
+    Como el ancho (b-a) = 2·L·√c2 NO depende del strike (solo el centro se desplaza por
+    x0), la malla de frecuencias u_k = kπ/(b-a) sigue siendo la MISMA para todos los
+    strikes -- se vectoriza sin perder velocidad. Lo que sí varía por strike es dónde cae
+    el soporte del payoff dentro de la ventana (c_eff = clip(a,0,b)), generalizado para
+    cubrir también el caso todo-ITM (a>=0, integrar la ventana completa) y todo-OTM
+    (b<=0, payoff nulo) -- antes se asumía siempre a<0<b."""
     rd = r - q
     c1 = rd * tau + (1 - np.exp(-kappa * tau)) * (theta - v0) / (2 * kappa) - 0.5 * theta * tau
     c2 = (1.0 / (8 * kappa**3)) * (
@@ -235,27 +266,43 @@ def _cos_call_raw(S0, K_array, r, q, tau, v0, kappa, theta, xi, rho, N=512, L=20
     )
     if c2 <= 0:
         return None, c2
-    a = c1 - L * np.sqrt(c2)
-    b = c1 + L * np.sqrt(c2)
+
+    half_width = L * np.sqrt(c2)
     k = np.arange(N)
-    u = k * np.pi / (b - a)
+    u = k * np.pi / (2 * half_width)  # ancho (b-a)=2*half_width, constante para todos los strikes
     u_cf = np.where(u == 0, 1e-8, u)
-    c_, d_ = 0.0, b
-    chi = (1 / (1 + u**2)) * (
-        np.cos(k * np.pi * (d_ - a) / (b - a)) * np.exp(d_)
-        - np.cos(k * np.pi * (c_ - a) / (b - a)) * np.exp(c_)
-        + u * np.sin(k * np.pi * (d_ - a) / (b - a)) * np.exp(d_)
-        - u * np.sin(k * np.pi * (c_ - a) / (b - a)) * np.exp(c_)
+
+    x0 = np.log(S0 / K_array)               # x0_i = log(S0/K_i), un valor por strike
+    a = x0 + c1 - half_width                # ventana DESPLAZADA por strike (el fix)
+    b = x0 + c1 + half_width
+    c_eff = np.clip(a, 0.0, None)
+    c_eff = np.minimum(c_eff, b)             # generaliza a todo-ITM (a>=0) y todo-OTM (b<=0)
+
+    bma = b - a                              # == 2*half_width, pero lo dejamos explícito por strike
+    kpi = np.outer(1.0 / bma, k * np.pi)     # (n_strikes, N) == kπ/(b-a)
+    d_minus_a = (b - a)[:, None]             # == bma, por construcción
+    c_minus_a = (c_eff - a)[:, None]
+
+    # NOTA: kpi ya incluye la división entre (b-a); el argumento de cos/sin es kpi*(x-a)
+    # directamente (NO kpi*(x-a)/bma otra vez -- ese fue un bug de una versión intermedia
+    # de este fix: dividir dos veces por (b-a) rompía chi/psi para cualquier strike lejos
+    # del spot, dando precios absurdos incluso peores que el bug original).
+    chi = (1.0 / (1 + kpi**2)) * (
+        np.cos(kpi * d_minus_a) * np.exp(b)[:, None]
+        - np.cos(kpi * c_minus_a) * np.exp(c_eff)[:, None]
+        + kpi * np.sin(kpi * d_minus_a) * np.exp(b)[:, None]
+        - kpi * np.sin(kpi * c_minus_a) * np.exp(c_eff)[:, None]
     )
     psi = np.where(
-        k == 0, d_ - c_,
-        (np.sin(k * np.pi * (d_ - a) / (b - a)) - np.sin(k * np.pi * (c_ - a) / (b - a))) * (b - a) / (k * np.pi + 1e-30),
+        k[None, :] == 0,
+        (b - c_eff)[:, None],
+        (np.sin(kpi * d_minus_a) - np.sin(kpi * c_minus_a)) * (bma[:, None] / (k[None, :] * np.pi + 1e-300)),
     )
-    Uk = 2 / (b - a) * (chi - psi)
-    cf0 = heston_cf_j(u_cf, 2, 0.0, v0, tau, r, q, kappa, theta, xi, rho)
-    X = np.log(S0 / K_array)
-    phase = np.exp(1j * np.outer(X - a, u))
-    terms = np.real(phase * cf0[None, :]) * Uk[None, :]
+    Uk = 2.0 / bma[:, None] * (chi - psi)    # (n_strikes, N)
+
+    cf0 = heston_cf_j(u_cf, 2, 0.0, v0, tau, r, q, kappa, theta, xi, rho)  # (N,), independiente del strike
+    phase = np.exp(1j * u[None, :] * (x0[:, None] - a[:, None]))          # (n_strikes, N)
+    terms = np.real(phase * cf0[None, :]) * Uk
     terms[:, 0] *= 0.5
     prices = K_array * np.exp(-r * tau) * terms.sum(axis=1)
     return prices, c2
@@ -421,24 +468,33 @@ HESTON_NAMES = ["v0", "theta", "kappa", "xi", "rho"]
 
 
 def calibrate_heston(market_rows, S0, r, q, n_candidatos=30, n_refinar=10, seed=1,
-                     feller_penalty_weight=0.0, max_nfev=200, kappa_fijo=None):
+                     feller_penalty_weight=0.0, max_nfev=200, kappa_fijo=None,
+                     var_ceiling=0.20):
     """market_rows: lista de tuplas (K, tau, price_mkt, spread, option_type).
-    CORREGIDO: la version anterior de este archivo usaba max_nfev=10 y solo 10
-    candidatos LHS / 4 refinados, "verbatim" del notebook 4 -- ese presupuesto es
-    demasiado bajo para que least_squares converja de verdad en un ajuste no lineal
-    de 5 parametros. Con max_nfev=10 el optimizador se detiene a medio camino y
-    puede devolver parametros de Heston absurdos (precios que no calzan ni de lejos
-    con el mercado) -- este fue justamente el bug diagnosticado y corregido en
-    heston_engine.py durante este proyecto. Aqui se aplica el mismo arreglo:
-    30 candidatos LHS, 10 refinados, max_nfev=200.
+    CORREGIDO: este archivo traia max_nfev=10 y solo 10 candidatos LHS / 4 refinados
+    ("verbatim" del notebook 4) -- presupuesto insuficiente para que least_squares
+    converja en un ajuste no lineal de 5 parametros; podia devolver parametros de
+    Heston que no calzan con el mercado (el mismo bug ya diagnosticado y corregido
+    en heston_engine.py durante este proyecto). Se sube a 30 candidatos LHS, 10
+    refinados, max_nfev=200 -- mismo presupuesto validado en el resto del proyecto.
     Los residuals usan el motor COS híbrido (notebook 6): idéntico a quad a ~1e-8 en la
     región de ajuste, solo más rápido; no cambia el resultado.
     feller_penalty_weight=0.0 por default: la condición de Feller se REPORTA como
     diagnóstico (igual que los notebooks — no se impone en la función objetivo);
     un peso >0 la activaría como soft-constraint opcional.
     kappa_fijo: mitigación del valle de identificabilidad κ–ξ (notebook 5) — fija κ
-    a (casi) ese valor y calibra solo los otros 4 parámetros."""
+    a (casi) ese valor y calibra solo los otros 4 parámetros.
+    var_ceiling: techo superior de v0/theta (varianza). El default 0.20 (~44.7% vol)
+    alcanza para vencimientos normales, pero es matemáticamente insuficiente para
+    contratos de τ ultra-corto (0-3 DTE) cuya IV anualizada implícita puede superar
+    300-400% sin que el precio en sí sea nada extraordinario — es un artefacto de
+    anualizar sobre un τ diminuto. calibrate_for_expiry calcula este techo dinámicamente
+    a partir de la IV ATM observada; sin ese ajuste el optimizador queda forzado a un
+    problema infactible dentro de bounds y colapsa a una esquina degenerada (precio y
+    griegas ≈ 0, Feller aparentemente violado) en vez de converger a un ajuste real."""
     bounds_local = [tuple(b) for b in HESTON_BOUNDS]
+    bounds_local[0] = (bounds_local[0][0], max(bounds_local[0][1], var_ceiling))
+    bounds_local[1] = (bounds_local[1][0], max(bounds_local[1][1], var_ceiling))
     if kappa_fijo is not None:
         eps = max(abs(kappa_fijo) * 1e-4, 1e-4)
         bounds_local[2] = (kappa_fijo - eps, kappa_fijo + eps)  # índice 2 = kappa
@@ -460,10 +516,19 @@ def calibrate_heston(market_rows, S0, r, q, n_candidatos=30, n_refinar=10, seed=
             res_parts = []
             if len(K_calls) > 0:
                 pm_c = heston_prices_fast(S0, K_calls, r, q, tau_, v0, kappa, theta, xi, rho, "call")
-                res_parts.append(w_calls * (pm_c - p_calls))
+                # Normalizar por precio de mercado (error RELATIVO), no solo por spread.
+                # Sin esto, dos strikes con el mismo error en dólares pesan IGUAL en la suma
+                # de cuadrados aunque uno sea un contrato caro (error relativo chico) y el
+                # otro sea barato -- p.ej. un ATM de vencimiento ultra-corto (τ=2 días), cuyo
+                # precio en dólares es intrínsecamente chico. El optimizador "gasta" su
+                # presupuesto de ajuste en los strikes caros y descuida los baratos, aunque
+                # estén dentro del conjunto de calibración -- eso es exactamente lo que
+                # producía errores de +190% en contratos ATM de τ chico pese a que la IV de
+                # contrato (vía B&S) fuera perfectamente razonable.
+                res_parts.append(w_calls * (pm_c - p_calls) / np.maximum(p_calls, 0.05))
             if len(K_puts) > 0:
                 pm_p = heston_prices_fast(S0, K_puts, r, q, tau_, v0, kappa, theta, xi, rho, "put")
-                res_parts.append(w_puts * (pm_p - p_puts))
+                res_parts.append(w_puts * (pm_p - p_puts) / np.maximum(p_puts, 0.05))
             res = np.concatenate(res_parts) if res_parts else np.array([])
             if not np.all(np.isfinite(res)):
                 res = np.where(np.isfinite(res), res, 1e3)
@@ -501,7 +566,11 @@ def feller_condition(params):
 # ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_risk_free_rate():
-    """13-week T-Bill (FRED DTB3) como proxy de tasa libre de riesgo. Fallback si falla."""
+    """13-week T-Bill (FRED DTB3) como proxy de tasa libre de riesgo. Fallback si falla.
+    Fallback actualizado a 3.78% (nivel real del 13-week T-Bill al momento de este commit)
+    -- antes tenía 4.5%, desactualizado; si la llamada en vivo a FRED falla (red restringida,
+    FRED caído, etc. -- puede pasar justo en la defensa en vivo) es mejor que el respaldo
+    esté cerca del nivel real de mercado en vez de un número viejo."""
     try:
         import pandas_datareader.data as web
         from datetime import datetime, timedelta
@@ -511,16 +580,46 @@ def get_risk_free_rate():
         df = web.DataReader("DTB3", "fred", start, end)
         return float(df.dropna().iloc[-1, 0]) / 100.0
     except Exception:
-        return 0.045  # fallback razonable
+        return 0.0378  # fallback: 13-week T-Bill ~3.78% (actualizar periódicamente)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)  # 60s, no 30min: en 0-3DTE el spot/bid/ask se mueven demasiado rápido
 def get_underlying_info(ticker):
     tk = yf.Ticker(ticker)
     hist = tk.history(period="5d")
     if hist.empty:
         raise ValueError("Sin datos de precio para este ticker.")
-    S0 = float(hist["Close"].iloc[-1])
+
+    # yfinance a veces incluye la sesión en curso con Close=NaN (dato parcial /
+    # no cerrado todavía). Tomamos el último Close VÁLIDO, no simplemente el
+    # último renglón del DataFrame.
+    close_series = hist["Close"].dropna()
+    if close_series.empty:
+        # Fallback 1: fast_info (suele tener el último precio incluso cuando
+        # la vela diaria todavía no tiene Close).
+        try:
+            fi_price = tk.fast_info.get("last_price")
+            if fi_price and not np.isnan(fi_price):
+                close_series = pd.Series([float(fi_price)])
+        except Exception:
+            pass
+
+    if close_series.empty:
+        # Fallback 2: reintenta con una ventana más larga por si la de 5 días
+        # cayó en un tramo con feriados/datos faltantes.
+        hist_long = tk.history(period="1mo")
+        close_series = hist_long["Close"].dropna()
+
+    if close_series.empty:
+        raise ValueError(
+            "No se pudo obtener un precio spot válido (Close=NaN en todos los "
+            "intentos). Puede ser un problema temporal del feed de datos."
+        )
+
+    S0 = float(close_series.iloc[-1])
+    if not np.isfinite(S0) or S0 <= 0:
+        raise ValueError(f"Precio spot inválido recibido: {S0!r}.")
+
     q = _robust_dividend_yield(tk, S0)
     expiries = list(tk.options)
     return S0, q, expiries
@@ -556,53 +655,80 @@ def _robust_dividend_yield(tk, S0):
     return 0.0
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)  # 60s, no 30min: bid/ask de 0-3DTE cambian ~60-70% intradía
 def get_clean_chain(ticker, expiry):
     """Descarga y limpia la cadena de opciones (calls y puts) para un expiry dado.
-    Devuelve (df_limpio, diagnostico) -- diagnostico trae conteos crudos por lado
-    (calls/puts) y cuantos sobrevivieron cada filtro, para poder explicar un chain
-    vacio en vez de solo reportar "no hay quotes liquidas". Tambien corrige un bug:
-    la version anterior comparaba bid/ask NaN directo contra 0 (NaN<=0 es False en
-    Python), asi que filas sin cotizacion real podian colarse; ahora se usa
-    pd.isna() explicito."""
+    Limpieza = checklist literal del brief: (1) drop zero-bid rows, (2) drop zero-volume
+    rows, (3) filter by spread < threshold (spread relativo (ask-bid)/mid < 50% — corta
+    quotes basura de las alas), (4) todo alineado a un único snapshot timestamp que se
+    guarda en la columna 'snapshot' y se muestra en el sidebar. La conversión
+    τ=(T−t)/365 vive en tau_from_expiry.
+
+    Fallback de liquidez: el filtro 'volumen>0' es literal del brief y correcto como
+    default, pero en nombres menos líquidos que los grandes ETFs/megacaps (p.ej. HPE)
+    puede dejar CASI NADA para un vencimiento, aunque el market maker sí sostenga bid/ask
+    en vivo sobre strikes con open interest pero sin operaciones HOY. Si el filtro
+    estricto deja menos de cuatro quotes para este expiry, se reintenta permitiendo
+    volumen=0 siempre que haya open interest>0 (evidencia de que el contrato existe y
+    tiene posiciones abiertas, aunque no haya cruzado hoy) -- las filas que usaron este
+    relajo quedan marcadas en 'liquidity_relaxed' para que la UI lo declare, no lo
+    esconda."""
     tk = yf.Ticker(ticker)
     chain = tk.option_chain(expiry)
-    rows = []
-    diag = {}
-    for df, otype in [(chain.calls, "call"), (chain.puts, "put")]:
-        n0 = len(df)
-        n_bidask = 0
-        n_liquido = 0
-        for _, row in df.iterrows():
-            bid, ask = row.get("bid", 0), row.get("ask", 0)
-            if pd.isna(bid) or pd.isna(ask) or bid <= 0 or ask <= 0:
-                continue
-            n_bidask += 1
-            vol = row.get("volume", 0)
-            vol = 0 if pd.isna(vol) else vol
-            oi = row.get("openInterest", 0)
-            oi = 0 if pd.isna(oi) else oi
-            if vol <= 0 and oi <= 0:
-                continue  # descarta ilíquidos sin volumen NI open interest
-            n_liquido += 1
-            mid = (bid + ask) / 2.0
-            spread = ask - bid
-            rows.append(
-                {
-                    "strike": float(row["strike"]),
-                    "type": otype,
-                    "bid": bid,
-                    "ask": ask,
-                    "mid": mid,
-                    "spread": spread,
-                    "volume": vol,
-                    "openInterest": oi,
-                    "impliedVolatility": row.get("impliedVolatility", np.nan),
-                }
-            )
-        diag[otype] = {"crudos_yfinance": n0, "con_bid_ask_valido": n_bidask, "liquidos": n_liquido}
+    snapshot_ts = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    MAX_REL_SPREAD = 0.50
+
+    def _clean(allow_oi_fallback):
+        rows_ = []
+        for df, otype in [(chain.calls, "call"), (chain.puts, "put")]:
+            for _, row in df.iterrows():
+                bid, ask = row.get("bid", 0), row.get("ask", 0)
+                vol = row.get("volume", 0) or 0
+                oi = row.get("openInterest", 0) or 0
+                if bid is None or ask is None:
+                    continue
+                if bid <= 0 or ask <= 0:
+                    continue  # drop zero-bid rows (brief)
+                relaxed = False
+                if vol <= 0:
+                    if allow_oi_fallback and oi > 0:
+                        relaxed = True  # sin volumen hoy, pero con open interest > 0
+                    else:
+                        continue  # drop zero-volume rows (brief, literal)
+                mid = (bid + ask) / 2.0
+                spread = ask - bid
+                if mid <= 0 or (spread / mid) > MAX_REL_SPREAD:
+                    continue  # filter by spread < threshold (brief)
+                rows_.append(
+                    {
+                        "strike": float(row["strike"]),
+                        "type": otype,
+                        "bid": bid,
+                        "ask": ask,
+                        "mid": mid,
+                        "spread": spread,
+                        "volume": vol,
+                        "openInterest": oi,
+                        "impliedVolatility": row.get("impliedVolatility", np.nan),
+                        "lastPrice": row.get("lastPrice", np.nan),
+                        "snapshot": snapshot_ts,
+                        "liquidity_relaxed": relaxed,
+                    }
+                )
+        return rows_
+
+    rows = _clean(allow_oi_fallback=False)
+    if len(rows) < 4:
+        rows = _clean(allow_oi_fallback=True)
+
+    CHAIN_COLUMNS = [
+        "strike", "type", "bid", "ask", "mid", "spread", "volume",
+        "openInterest", "impliedVolatility", "lastPrice", "snapshot", "liquidity_relaxed",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=CHAIN_COLUMNS)
     df = pd.DataFrame(rows)
-    return df, diag
+    return df
 
 
 def tau_from_expiry(expiry_str):
@@ -672,6 +798,14 @@ if data_error:
     st.sidebar.error(f"No se pudo descargar '{ticker}': {data_error}")
     st.stop()
 
+if S0 is None or not np.isfinite(S0) or S0 <= 0:
+    st.sidebar.error(
+        f"Precio spot inválido para '{ticker}' (S0={S0!r}). "
+        "El feed de datos devolvió un valor no numérico; reintenta en unos "
+        "segundos o revisa el ticker."
+    )
+    st.stop()
+
 if not expiries:
     st.sidebar.warning("Este ticker no tiene opciones listadas.")
     st.stop()
@@ -697,30 +831,17 @@ expiry = st.sidebar.selectbox("Vencimiento (expiry)", expiries, key="expiry_sele
 option_type = st.sidebar.radio("Tipo de contrato", ["call", "put"], horizontal=True, key="type_radio")
 
 with st.spinner("Descargando y limpiando cadena de opciones..."):
-    chain_df, chain_diag = get_clean_chain(ticker, expiry)
+    chain_df = get_clean_chain(ticker, expiry)
 
 if chain_df.empty:
-    st.sidebar.warning(
-        f"No quedaron quotes líquidas tras la limpieza para este vencimiento. "
-        f"Diagnóstico: {chain_diag}"
-    )
+    st.sidebar.warning("No quedaron quotes líquidas tras la limpieza para este vencimiento.")
     st.stop()
 
 sub_chain = chain_df[chain_df["type"] == option_type].sort_values("strike")
 strikes_available = sub_chain["strike"].unique().tolist()
 
 if not strikes_available:
-    d = chain_diag.get(option_type, {})
-    st.sidebar.warning(
-        f"No hay {option_type}s líquidos para este vencimiento. "
-        f"yfinance devolvió {d.get('crudos_yfinance', '?')} contratos {option_type} en crudo, "
-        f"{d.get('con_bid_ask_valido', '?')} con bid/ask cotizado, y "
-        f"{d.get('liquidos', '?')} con volumen u open interest > 0. "
-        f"Si el primer número ya es 0 o muy bajo, es la cadena real de yfinance para este "
-        f"vencimiento (prueba otro expiry); si cae después, es liquidez real de mercado en "
-        f"este lado del chain. También puede ser cache viejo del deploy — prueba 'Clear cache' "
-        f"en el menú ⋮ de Streamlit Cloud."
-    )
+    st.sidebar.warning(f"No hay {option_type}s líquidos para este vencimiento.")
     st.stop()
 
 # Si viene de un símbolo OCC, pre-seleccionamos el strike líquido más cercano al pedido
@@ -745,6 +866,12 @@ with st.sidebar.expander("⚙ Calibración de Heston"):
              "de reversión en vez de dejar que el dato la determine.",
     )
     kappa_fijo_val = st.slider("Valor de κ fijo", 0.1, 6.0, 2.0, 0.1, disabled=not fijar_kappa) if fijar_kappa else None
+    if fijar_kappa and tau_from_expiry(expiry) < 5 / 365:
+        st.caption(
+            "⚠ Vencimiento ultra-corto (<5 días): fijar κ quita justo la flexibilidad "
+            "que la calibración más necesita aquí. Si Heston sale en $0 / griegas en 0, "
+            "prueba desmarcar esta opción."
+        )
 
 r = get_risk_free_rate()
 tau = tau_from_expiry(expiry)
@@ -761,7 +888,34 @@ st.sidebar.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.sidebar.caption(f"Quotes líquidas en este expiry: {len(chain_df)}")
+_snap = chain_df["snapshot"].iloc[0] if ("snapshot" in chain_df.columns and len(chain_df)) else "—"
+_snap_age_min = None
+if _snap != "—":
+    try:
+        _snap_age_min = (pd.Timestamp.now() - pd.Timestamp(_snap)).total_seconds() / 60.0
+    except Exception:
+        pass
+st.sidebar.caption(
+    f"Quotes líquidas en este expiry: {len(chain_df)}  ·  Snapshot: {_snap}"
+)
+_n_relaxed = int(chain_df["liquidity_relaxed"].sum()) if "liquidity_relaxed" in chain_df.columns else 0
+if _n_relaxed > 0:
+    st.sidebar.info(
+        f"ℹ️ {_n_relaxed} de estas quotes no tuvieron volumen operado HOY, pero se incluyeron "
+        "porque tienen open interest > 0 (evidencia de que el contrato existe y el market maker "
+        "sostiene bid/ask). Se activó porque el filtro estricto (volumen>0, regla literal del "
+        "brief) dejaba menos de 4 quotes para este vencimiento -- típico en tickers menos "
+        "líquidos que los grandes ETFs/megacaps."
+    )
+if _snap_age_min is not None and _snap_age_min > 2:
+    st.sidebar.warning(
+        f"⚠ Datos con {_snap_age_min:.0f} min de antigüedad. En contratos de vencimiento "
+        "ultra-corto (0-3 DTE) el bid/ask puede moverse 50%+ en minutos — dale a "
+        "'Refrescar datos' antes de la defensa en vivo."
+    )
+if st.sidebar.button("🔄 Refrescar datos (limpiar caché)"):
+    st.cache_data.clear()
+    st.rerun()
 
 
 # ============================================================
@@ -782,8 +936,15 @@ st.markdown(
 # ============================================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def calibrate_for_expiry(ticker, expiry, S0, r, q, kappa_fijo=None):
-    df, _ = get_clean_chain(ticker, expiry)
+    df = get_clean_chain(ticker, expiry)
     tau_ = tau_from_expiry(expiry)
+
+    if df.empty:
+        # Este vencimiento no tiene ni una quote que sobreviva la limpieza (zero-bid,
+        # zero-volume, spread excesivo). Salimos con gracia -- el caller (incluido el
+        # loop de la superficie 3D, que recorre varios expiries y espera que algunos
+        # fallen) ya sabe manejar params_=None.
+        return None, None, 0, None
 
     # Selección de quotes según el estándar del curso/equipos:
     # CALLS y PUTS juntos, bid>0 (ya garantizado por la limpieza de la cadena),
@@ -808,13 +969,63 @@ def calibrate_for_expiry(ticker, expiry, S0, r, q, kappa_fijo=None):
         for _, row in m.iterrows()
     ]
     if len(rows) < 4:
-        return None, None, 0
-    params, fit_obj = calibrate_heston(rows, S0, r, q, kappa_fijo=kappa_fijo)
-    return params, fit_obj, len(rows)
+        return None, None, 0, None
+
+    # ---- Techo dinámico de v0/theta a partir de la IV ATM real de este vencimiento ----
+    # Vencimientos ultra-cortos (0-3 DTE) pueden requerir IV anualizada >300% para
+    # reproducir un mid perfectamente normal (es aritmética de anualizar sobre τ chico,
+    # no un precio "raro"). Si dejamos var_ceiling en el 0.20 (~44.7% vol) por default,
+    # el problema de calibración es matemáticamente infactible y el optimizador termina
+    # en una esquina degenerada de bounds (precio/griegas colapsan a 0, Feller aparenta
+    # violarse). Estimamos la IV ATM con B&S y ampliamos el techo con margen 30%.
+    var_ceiling = 0.20
+    try:
+        atm_row_c = m.iloc[(m["strike"] - S0).abs().argsort()[:1]].iloc[0]
+        atm_iv_est = bs_implied_vol(
+            atm_row_c["mid"], S0, atm_row_c["strike"], r, q, tau_, atm_row_c["type"]
+        )
+        if np.isfinite(atm_iv_est) and atm_iv_est > 0:
+            var_ceiling = max(0.20, min(9.0, (atm_iv_est * 1.3) ** 2))
+    except Exception:
+        pass
+
+    params, fit_obj = calibrate_heston(rows, S0, r, q, kappa_fijo=kappa_fijo, var_ceiling=var_ceiling)
+
+    # ---- Diagnóstico: ¿el ajuste final realmente reproduce el mercado? ----
+    # fit_obj.cost es 0.5*sum(residuals^2) (convención scipy); lo traducimos a un RMSE
+    # relativo en precio para decidir si el resultado es confiable o si, pese al techo
+    # ampliado, el optimizador sigue sin poder calzar el smile (bounds de kappa/xi/rho,
+    # muy pocas quotes, datos ruidosos, etc.).
+    calib_warning = None
+    try:
+        prices_mkt = np.array([row[2] for row in rows])
+        v0_, theta_, kappa_, xi_, rho_ = params
+        K_c = np.array([row[0] for row in rows])
+        ot_c = [row[4] for row in rows]
+        prices_fit = np.array([
+            heston_price(S0, k, r, q, tau_, v0_, kappa_, theta_, xi_, rho_, ot)
+            for k, ot in zip(K_c, ot_c)
+        ])
+        rel_err = np.abs(prices_fit - prices_mkt) / np.maximum(prices_mkt, 0.01)
+        if np.median(rel_err) > 0.25:
+            calib_warning = (
+                "La calibración de Heston no logró reproducir el smile de este "
+                "vencimiento dentro de los bounds del modelo (error relativo mediano "
+                f"{np.median(rel_err)*100:.0f}%). Con τ tan corto esto suele pasar cuando "
+                "hay muy pocas quotes líquidas o el vencimiento es prácticamente 0DTE — "
+                "trata los precios/griegas de Heston aquí con cautela, o prueba otro "
+                "vencimiento con más profundidad de mercado."
+            )
+    except Exception:
+        pass
+
+    return params, fit_obj, len(rows), calib_warning
 
 
 with st.spinner("Calibrando Heston a la sonrisa de este vencimiento..."):
-    heston_params, fit_obj, n_quotes_calib = calibrate_for_expiry(ticker, expiry, S0, r, q, kappa_fijo_val)
+    heston_params, fit_obj, n_quotes_calib, calib_warning = calibrate_for_expiry(
+        ticker, expiry, S0, r, q, kappa_fijo_val
+    )
 
 if heston_params is None:
     st.warning(
@@ -822,6 +1033,9 @@ if heston_params is None:
         "Prueba otro expiry o ticker más líquido."
     )
     st.stop()
+
+if calib_warning:
+    st.warning(f"⚠ {calib_warning}")
 
 v0, theta, kappa, xi, rho = heston_params
 
@@ -939,16 +1153,44 @@ if is_extrapolated:
 c1, c2, c3 = st.columns(3)
 with c1:
     iv_txt = f" &middot; IV {float(market_iv)*100:.2f}%" if (market_iv is not None and np.isfinite(market_iv)) else ""
+    last_price_sel = row_sel.get("lastPrice", np.nan)
+    last_txt = (
+        f" &middot; último {last_price_sel:.2f}"
+        if (last_price_sel is not None and np.isfinite(last_price_sel) and last_price_sel > 0)
+        else ""
+    )
     st.markdown(
         f"""
         <div class="metric-card">
             <div class="label">Precio de mercado (mid)</div>
             <div class="value">${market_mid:,.2f}</div>
-            <div class="sub" style="color:#8492A6;">bid {row_sel['bid']:.2f} / ask {row_sel['ask']:.2f}{iv_txt}</div>
+            <div class="sub" style="color:#8492A6;">bid {row_sel['bid']:.2f} / ask {row_sel['ask']:.2f}{iv_txt}{last_txt}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+# ---------- Staleness check: ¿el último trade es consistente con el bid/ask actual? ----------
+# Bid/ask son cotizaciones en vivo (o casi); lastPrice es el precio de la última operación
+# EJECUTADA, que en un contrato ilíquido (como uno a 2 días de vencer) puede llevar horas
+# o hasta un día hábil de antigüedad — literalmente otro spot, otra hora. Que difieran NO
+# es un bug del pipeline: son dos observables distintos del mercado. El brief pide C_mkt =
+# mid de bid/ask (no lastPrice) precisamente por esto — el mid es lo único "actual".
+if (
+    last_price_sel is not None and np.isfinite(last_price_sel) and last_price_sel > 0
+    and not (row_sel["bid"] <= last_price_sel <= row_sel["ask"])
+):
+    st.info(
+        f"ℹ️ El último precio operado (**${last_price_sel:.2f}**) cae **fuera** del bid/ask actual "
+        f"(${row_sel['bid']:.2f} / ${row_sel['ask']:.2f}). Esto es normal en contratos poco líquidos: "
+        "`lastPrice` es el precio de la última operación EJECUTADA (puede ser de horas o de la sesión "
+        "anterior), mientras que bid/ask reflejan el mercado justo ahora. Por eso este dashboard usa "
+        "**mid de bid/ask** como `C_mkt` — el spec del proyecto lo pide así (\"Market option price = "
+        "mid of bid/ask\") precisamente porque es el único de los dos que es simultáneo con el spot S₀ "
+        "usado para pricear. Si el broker te muestra un 'último' distinto al mid de este dashboard, "
+        "esa es la explicación — no una descarga incorrecta."
+    )
+
 with c2:
     color = "#5FDCB4" if abs(err_bs_rel) < abs(err_heston_rel) else "#F0A85C"
     st.markdown(
@@ -1357,23 +1599,61 @@ st.caption(
 )
 
 
+SMILE_COLUMNS = ["strike", "moneyness", "log_moneyness", "iv", "type"]
+
+
 def build_smile_data(chain_df, S0, r, q, tau):
     """Construye el smile usando el lado OTM de cada strike (puts para K<S0, calls para K>=S0) —
-    es el lado típicamente más líquido y la convención estándar para graficar un smile."""
+    es el lado típicamente más líquido y la convención estándar para graficar un smile.
+
+    Eje x = log-moneyness ln(K/S₀) (convención estándar, Gatheral "The Volatility Surface"):
+    simétrico alrededor de ATM=0, y es la variable natural en la que Heston/el smile suelen
+    describirse — moneyness lineal (K/S₀) comprime las alas OTM y estira las ITM de forma
+    asimétrica, dificultando comparar skew put vs call a simple vista.
+
+    Tope de IV: vencimientos ultra-cortos (0-3 DTE) pueden anualizar a IVs muy por encima
+    de 300% sin que el precio en sí sea nada anómalo (mismo fenómeno que ya vimos en el
+    badge de B&S). Si el tope es demasiado estricto, TODAS las quotes de un expiry corto
+    pueden quedar descartadas, dejando 'rows' vacío -> DataFrame sin columnas -> el
+    sort_values('log_moneyness') de más abajo truena con KeyError en vez de fallar con
+    gracia. Dos fixes: tope más generoso (acorde al var_ceiling dinámico de calibración)
+    y devolver siempre un DataFrame con las columnas esperadas, aunque esté vacío."""
     rows = []
     for _, row in chain_df.iterrows():
         otype = "call" if row["strike"] >= S0 else "put"
         if row["type"] != otype:
             continue
         iv = bs_implied_vol(row["mid"], S0, row["strike"], r, q, tau, otype)
-        if not np.isnan(iv) and 0.01 < iv < 3.0:
-            rows.append({"strike": row["strike"], "moneyness": row["strike"] / S0, "iv": iv, "type": otype})
-    return pd.DataFrame(rows).sort_values("moneyness").reset_index(drop=True)
+        if not np.isnan(iv) and 0.01 < iv < 10.0:
+            m = row["strike"] / S0
+            rows.append({"strike": row["strike"], "moneyness": m, "log_moneyness": np.log(m), "iv": iv, "type": otype})
+    if not rows:
+        return pd.DataFrame(columns=SMILE_COLUMNS)
+    return pd.DataFrame(rows).sort_values("log_moneyness").reset_index(drop=True)
+
+
+def build_heston_smile_curve(S0, r, q, tau, params, k_min, k_max, n_points=60):
+    """Curva de IV de Heston en una malla DENSA de strikes (n_points, independiente de qué
+    strikes tuvieron quotes líquidas). Antes, la curva de Heston del smile se evaluaba SOLO
+    en los strikes de mercado que sobrevivieron el filtro de liquidez -- en un vencimiento
+    corto eso puede ser apenas 4-12 puntos, y conectados por 'lines+markers' se ve dentado /
+    poligonal, no una curva suave. El brief pide explícitamente 'Overlay the Heston-implied
+    smile after calibration — it should curve to match' — una curva de verdad, evaluada en
+    el modelo calibrado, no una interpolación lineal entre pocos puntos de mercado.
+    Devuelve (log_moneyness_grid, iv_grid) usando la misma convención OTM (put si K<S0, call si no)."""
+    v0_, theta_, kappa_, xi_, rho_ = params
+    K_grid = np.linspace(k_min, k_max, n_points)
+    ivs = []
+    for K in K_grid:
+        otype = "call" if K >= S0 else "put"
+        price = heston_price(S0, K, r, q, tau, v0_, kappa_, theta_, xi_, rho_, otype)
+        ivs.append(bs_implied_vol(price, S0, K, r, q, tau, otype))
+    return np.log(K_grid / S0), np.array(ivs)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def compute_smile(ticker, expiry, S0, r, q, tau, heston_params_tuple):
-    chain_full, _ = get_clean_chain(ticker, expiry)
+    chain_full = get_clean_chain(ticker, expiry)
     smile_df = build_smile_data(chain_full, S0, r, q, tau)
     if smile_df.empty:
         return smile_df
@@ -1393,10 +1673,10 @@ if smile_df.empty or smile_df["heston_iv"].isna().all():
     st.warning("No hay suficientes quotes OTM líquidas en este vencimiento para construir el smile.")
 else:
     valid = smile_df.dropna(subset=["heston_iv"])
-    # σ plana de B&S para el smile: mediana de las IVs cercanas al ATM (|log m|<0.03),
+    # σ plana de B&S para el smile: mediana de las IVs cercanas al ATM (|log-moneyness|<0.03),
     # con fallback a la mediana general — regla estándar de los equipos del curso
     # (más robusta que la IV de un solo strike ATM).
-    near_atm = smile_df[np.abs(np.log(smile_df["moneyness"])) < 0.03]["iv"]
+    near_atm = smile_df[np.abs(smile_df["log_moneyness"]) < 0.03]["iv"]
     sigma_flat = float(np.nanmedian(near_atm)) if len(near_atm) else float("nan")
     if not np.isfinite(sigma_flat):
         sigma_flat = float(np.nanmedian(smile_df["iv"])) if len(smile_df) else sigma_atm
@@ -1423,26 +1703,41 @@ else:
         unsafe_allow_html=True,
     )
 
+    # Curva de Heston en malla DENSA (no solo en los strikes de mercado -- ver
+    # build_heston_smile_curve) para que el overlay sea una curva suave de verdad,
+    # tal como pide el brief, y no una línea poligonal entre 4-12 puntos dispersos.
+    k_lo = float(smile_df["strike"].min()) * 0.97
+    k_hi = float(smile_df["strike"].max()) * 1.03
+    curve_lm, curve_iv = build_heston_smile_curve(S0, r, q, tau, tuple(heston_params), k_lo, k_hi, n_points=60)
+    curve_mask = np.isfinite(curve_iv)
+
+    # Eje x = log-moneyness ln(K/S₀) (convención estándar, Gatheral): simétrico alrededor
+    # de ATM=0, en vez de moneyness lineal K/S₀ (asimétrica, comprime las alas OTM).
     fig3 = go.Figure()
     fig3.add_trace(go.Scatter(
-        x=smile_df["moneyness"], y=smile_df["iv"] * 100, mode="markers", name="Mercado (OTM)",
+        x=smile_df["log_moneyness"], y=smile_df["iv"] * 100, mode="markers", name="Mercado (OTM)",
         marker=dict(color="#EAF2FB", size=8, symbol="circle"),
-        text=smile_df["type"], hovertemplate="moneyness=%{x:.2f}<br>IV=%{y:.2f}%<br>%{text}<extra></extra>",
+        text=smile_df["type"], hovertemplate="ln(K/S₀)=%{x:.3f}<br>IV=%{y:.2f}%<br>%{text}<extra></extra>",
     ))
     fig3.add_trace(go.Scatter(
-        x=smile_df["moneyness"], y=[sigma_flat * 100] * len(smile_df), mode="lines", name=f"B&S (σ plana = {sigma_flat*100:.1f}%)",
+        x=smile_df["log_moneyness"], y=[sigma_flat * 100] * len(smile_df), mode="lines", name=f"B&S (σ plana = {sigma_flat*100:.1f}%)",
         line=dict(color="#3B82C4", width=2.5, dash="dot"),
     ))
     fig3.add_trace(go.Scatter(
-        x=smile_df["moneyness"], y=smile_df["heston_iv"] * 100, mode="lines+markers", name="Heston (calibrado)",
-        line=dict(color="#1FAE85", width=2.5), marker=dict(size=5),
+        x=curve_lm[curve_mask], y=curve_iv[curve_mask] * 100, mode="lines", name="Heston (calibrado, curva)",
+        line=dict(color="#1FAE85", width=2.5),
     ))
-    fig3.add_vline(x=1.0, line_dash="dash", line_color="#8492A6", annotation_text="ATM", annotation_font_color="#8492A6")
-    fig3.add_vline(x=strike / S0, line_color="#D9822B", annotation_text="Seleccionado", annotation_font_color="#D9822B")
+    fig3.add_trace(go.Scatter(
+        x=smile_df["log_moneyness"], y=smile_df["heston_iv"] * 100, mode="markers", name="Heston (en strikes de mercado)",
+        marker=dict(color="#1FAE85", size=6, symbol="diamond"),
+        hovertemplate="ln(K/S₀)=%{x:.3f}<br>Heston IV=%{y:.2f}%<extra></extra>",
+    ))
+    fig3.add_vline(x=0.0, line_dash="dash", line_color="#8492A6", annotation_text="ATM", annotation_font_color="#8492A6")
+    fig3.add_vline(x=np.log(strike / S0), line_color="#D9822B", annotation_text="Seleccionado", annotation_font_color="#D9822B")
     fig3.update_layout(
         template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         height=420, margin=dict(l=10, r=10, t=30, b=10),
-        xaxis_title="Moneyness (K/S₀)", yaxis_title="Volatilidad implícita (%)",
+        xaxis_title="Log-moneyness ln(K/S₀)", yaxis_title="Volatilidad implícita (%)",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig3, use_container_width=True)
@@ -1512,7 +1807,7 @@ else:
                     tau_ = tau_from_expiry(exp_)
                     if tau_ < 2 / 365:
                         continue
-                    params_, _ = calibrate_for_expiry(ticker, exp_, S0, r, q)
+                    params_, _, _, _ = calibrate_for_expiry(ticker, exp_, S0, r, q)
                     if params_ is None:
                         continue
                     v0_, theta_, kappa_, xi_, rho_ = params_
@@ -1711,11 +2006,10 @@ st.markdown(
     <b>Metodología del optimizador:</b> búsqueda global por Latin
     Hypercube (30 candidatos, seed=1, dentro de los bounds del notebook) + refinamiento local
     least_squares/TRF de los 10 mejores (max_nfev=200), con residuos ponderados por
-    1/max(spread, 0.01). El presupuesto original de este notebook (10 candidatos, max_nfev=10,
-    "verbatim" del notebook 4) resultó insuficiente para que least_squares converja en las 5
-    dimensiones del ajuste — podía devolver parámetros de Heston que no calzaban con el mercado.
-    Se corrigió aquí con el mismo presupuesto ya validado en el resto del proyecto. La condición
-    de Feller se trata como
+    1/max(spread, 0.01). El presupuesto original (10 candidatos, max_nfev=10, "verbatim" del
+    notebook 4) resultó insuficiente para que least_squares converja en las 5 dimensiones del
+    ajuste; se corrigió con el mismo presupuesto ya validado en el resto del proyecto.
+    La condición de Feller se trata como
     <b>diagnóstico</b> (igual que los notebooks del curso): se reporta pero no se impone — el mercado puede
     exigir un skew que la viole. Opcional en el sidebar: <b>fijar κ</b> (mitigación del valle de
     identificabilidad κ–ξ del notebook 5) para parámetros más estables entre corridas.<br><br>
